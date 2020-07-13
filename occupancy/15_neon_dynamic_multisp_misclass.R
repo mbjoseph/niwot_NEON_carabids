@@ -21,10 +21,18 @@ ind_dat <- read_csv("occupancy/model_df_by_individual_beetle.csv", col_names = T
     filter(collectDate <= "2018-12-31") %>%
     dplyr::select(-c(X1))
 
+common_morpho <- ind_dat %>%
+  count(para_morph) %>%
+  filter(n > 10)
+
+ind_dat <- ind_dat %>%
+  filter(para_morph %in% common_morpho$para_morph)
+
 # Each row is a sample. One sample is a para_morph at a trap on a collection day   
 sample_dat <- read_csv("occupancy/model_df_by_species_in_sample_2015-2018.csv", 
                         col_names = TRUE) %>%
-    dplyr::select(-c(X1))
+    dplyr::select(-c(X1)) %>%
+  filter(para_morph %in% ind_dat$para_morph)
 
 
 # EDA ---------------------------------------------------------------------
@@ -94,11 +102,11 @@ rownames <- c(ind_dat %>%   #1) the unique expert taxonomist ID's
                     filter(!is.na(expert_sciname)) %>%
                     distinct() %>%
                     pull(expert_sciname),
-              ind_dat %>%   #2) the parataxonomist IDs that the expert taxonomist didn't use. 
+              ind_dat %>%   #2) the parataxonomist IDs that the expert taxonomist didn't use.
                 select(para_sciname) %>%
-                filter(!para_sciname %in% unique(ind_dat$expert_sciname)) %>% 
+                filter(!para_sciname %in% unique(ind_dat$expert_sciname)) %>%
                 distinct() %>%
-                pull(para_sciname) ) 
+                pull(para_sciname) )
 rownames <- sort(rownames)
 
 # List 1) the unique parataxonomist and morphospecies ID's and 2) the expert taxonomist IDs that the
@@ -134,14 +142,7 @@ n[is.na(n)] <- 0
 assertthat::assert_that(all(n_tib$expert_sciname == rownames))
 rm(n_tib)
 
-# Alpha: dirichlet concentration parameter
-alpha <- matrix(0.1, nrow=length(rownames),
-                ncol=length(colnames) ) 
-diag(alpha) <- 80
 
-test_alpha <- MCMCpack::rdirichlet(1000, c(80,rep(.1,73)))
-hist(test_alpha[,-1], xlim=c(0,1),col="red")
-hist(test_alpha[,1],  add=T)
 
 # Theta: misclassification probability matrix [KxK]
 # Theta has two parts. 
@@ -149,11 +150,6 @@ hist(test_alpha[,1],  add=T)
 # group 
 # Part 2: matrix appended as new columns on Theta that are “invalid” taxonomic
 # groups (all of the morphospecies)
-# theta <- array(NA, dim=c(nc*(ni - nb), length(rownames), length(colnames)) ) #same dimensions as theta output from model
-# for (k in 1:nrow(alpha)) {
-#     theta[ ,k, ] <- MCMCpack::rdirichlet(dim(theta)[1], alpha[k, ])
-# }
-
 
 # M_k: M[k,k'] is the number of individuals from species k (according to expert)
 # that were identified as species k' by parataxonomist [KxK]
@@ -180,6 +176,13 @@ M <- data.matrix(M)
 assertthat::assert_that(all(labels(M)[1][[1]] == rownames))
 assertthat::assert_that(all(labels(M)[2][[1]] == colnames))
 
+# Set up covariates for misclassification model ---------------------------
+alpha <- matrix(1.5, nrow = nrow(M), ncol = ncol(M))
+diag(alpha) <- 200
+
+xtest <- rdirichlet(n = 100000, alpha = alpha[1, ])
+hist(xtest[, 1], breaks = 100)
+hist(xtest[, 2], breaks = 100)
 
 # Combine occupancy and misclassification models to simulate observed data --------
 # c_obs: c_obs[i,j,k',l] are the elements of vector C, and represent the number
@@ -271,34 +274,35 @@ JAGSdata <- list(nsite = dim(c_obs)[1],
                  alpha = alpha,
                  M = M,
                  c_obs = c_obs,
+                 R = diag(rep(1, 5)),
                  Z = Z.dat) #bundle data
 JAGSinits <- function(){ list(Z = Z.init) }
 nc <- 4 #MCMC chains
-ni <- 4000 #MCMC iterations
-nt <- ni/1000  #MCMC thin
+ni <- 40000
+nt <- ni/2000
+
 
 # JAGS model
-JAGSparams <- c("psi", "lambda", "theta", "Z", "phi", "gamma", "n.occ", "growth", "turnover")
-cl <- makeCluster(4)
+JAGSparams <- c("psi", "lambda", "theta", "Z", "phi", 
+                "gamma", "n.occ", "growth", "turnover", 
+                "eps_spec", "mu_spec", "Tau_spec", 
+                "eps_site", "Tau_site")
+cl <- makeCluster(nc)
+
 out <- jags.parfit(cl = cl,
                    data = JAGSdata,
                    params = JAGSparams,
                    model = "occupancy/15_neon_dynamic_multisp_misclass_JAGS.txt",
                    inits = JAGSinits,
                    n.chains = nc,
-                   n.adapt = 2000,
-                   n.update = 2000,
+                   n.adapt = 5000,
+                   n.update = 5000,
                    thin = nt,
                    n.iter = ni)
 saveRDS(out, "occupancy/script15_jags_out.rds")
-library(MCMCvis)
 out_mcmcsumm <- MCMCsummary(out)
 saveRDS(out_mcmcsumm, "occupancy/script15_mcmcsumm_out.rds")
 
-# How well does the model estimate specified parameters?
-library(MCMCvis)
-out2_mcmcsumm <- MCMCsummary(out2)
-saveRDS(out2_mcmcsumm, "occupancy/script15_mcmcsumm_out2.rds")
 
 # View JAGS output --------------------------------------------------------
 
@@ -311,7 +315,24 @@ range(out_mcmcsumm$Rhat, na.rm=TRUE)
 
 # Look at high Rhat values
 out_mcmcsumm <- rownames_to_column(out_mcmcsumm)
-out_mcmcsumm %>% filter(Rhat > 1.8)
+out_mcmcsumm %>% filter(Rhat > 1.1)
+MCMCtrace(out, params = paste0('growth\\[1,1,4\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('psi\\[1,9,1\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('psi\\[1,7,4\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('gamma\\[1,10\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('gamma\\[1,7\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('phi\\[2,10\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('theta\\[1,15\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('theta\\[1,1\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('lambda\\[3,4\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('lambda\\[1,6\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('lambda\\[2,6\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('psi\\[4,6,3\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('psi\\[6,4,3\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('theta\\[16,2\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('eps_spec\\[6,4\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = "mu", type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = "Tau", type = 'both', ind = F, pdf=F, ISB=F)
 
 # Look at raw numbers
 # theta
@@ -321,25 +342,20 @@ theta_summ <- readRDS("occupancy/theta_summ.rds")
 hist(theta_summ$Rhat, breaks=20)
 
 theta_summ <- rownames_to_column(theta_summ)
-theta_summ %>% filter(Rhat > 1.1) #3295/3774 rows
-theta_summ %>% filter(Rhat > 1.8) #10 rows
+theta_summ %>% filter(Rhat > 1.01) #3295/3774 rows
 
 # Look at some theta posteriors with high Rhat values
-MCMCtrace(out, params = paste0('theta\\[47,5\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
-MCMCtrace(out, params = paste0('theta\\[32,25\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-MCMCtrace(out, params = paste0('theta\\[49,25\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-MCMCtrace(out, params = paste0('theta\\[32,32\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[6,6\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[7,7\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('theta\\[1,1\\]'), type = 'both', ind = F, pdf=F, ISB=F)
+MCMCtrace(out, params = paste0('theta\\[16,11\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[9,9\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[9,8\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[10,9\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[8,19\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[8,18\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
+MCMCtrace(out, params = paste0('theta\\[16,15\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
 ind_dat %>% filter(para_morph == rownames[32]) %>% select(para_sciname,expert_sciname)
-
-MCMCtrace(out, params = paste0('theta\\[38,41\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-MCMCtrace(out, params = paste0('theta\\[49,49\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-ind_dat %>% filter(para_morph == rownames[49]) %>% select(para_sciname,expert_sciname)
-
-MCMCtrace(out, params = paste0('theta\\[32,59\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-MCMCtrace(out, params = paste0('theta\\[49,62\\]'), type = 'both', ind = F, pdf=F, ISB=F)
-MCMCtrace(out, params = paste0('theta\\[32,64\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
-MCMCtrace(out, params = paste0('theta\\[49,64\\]'), type = 'both', ind = F, pdf=F, ISB=F) 
-MCMCsummary(out, params='theta\\[36,[0-9]+\\]', ISB=F)
 
 
 theta_df <- data.frame(expert_index = rep(1:dim(M)[1], dim(M)[2]) ,
@@ -352,10 +368,13 @@ theta_df$para_morph = factor(theta_df$para_morph, levels=colnames)
 
 # Plot heatmap of theta values
 ggplot(theta_df, aes(x=para_morph, y=expert_sciname, fill= theta_mean)) + 
-    geom_tile() +
-    scale_fill_gradient(low="darkblue", high="white") +
-    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
-    scale_y_discrete(limits = rev(levels(as.factor(theta_df$expert_sciname))))
+  geom_tile() +
+  scale_fill_viridis_c("Probability") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_y_discrete(limits = rev(levels(as.factor(theta_df$expert_sciname)))) + 
+  coord_equal() + 
+  xlab("Parataxonomist identification") + 
+  ylab("Expert identification")
 #consider on plotly: https://www.r-graph-gallery.com/79-levelplot-with-ggplot2.html
 
 
@@ -403,20 +422,6 @@ Z_summ <- MCMCsummary(out, params = 'Z', round=2)
 saveRDS(Z_summ, "occupancy/theta_summ.rds")
 #Z_summ <- readRDS("occupancy/theta_summ.rds")
 MCMCtrace(out, params = 'Z', type = 'density', ind = F, pdf=F)
-
-Z.dat[is.na(Z.dat)] <- 0
-Z.init[is.na(Z.init)] <- 0
-Z.prior <- Z.dat+Z.init
-plot(Z.prior, Z_summ$mean)
-#WORK ON ABOVE PLOT - MAKE SURE THEY PLOT 1-1 ACCURATELY, now it's not accurate
-plot(apply(c_obs, c(1,3,4), max, na.rm = TRUE), out$mean$Z)
-
-
-
-
-
-
-
 
 
 
